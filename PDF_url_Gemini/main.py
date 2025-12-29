@@ -9,6 +9,7 @@ import tempfile
 import ctypes
 import time
 import json
+import threading
 from ctypes import wintypes
 from git import Repo, GitCommandError
 import pyperclip
@@ -229,6 +230,8 @@ def _hide_lonely_console_window_on_windows():
     except Exception:
         return
 
+_STARTUP_WINDOW_MAIN_HWND = [0]
+
 def _cleanup_stray_startup_windows(app, main_window):
     try:
         for w in app.topLevelWidgets():
@@ -237,10 +240,11 @@ def _cleanup_stray_startup_windows(app, main_window):
             if not getattr(w, "isVisible", lambda: False)():
                 continue
             title = (getattr(w, "windowTitle", lambda: "")() or "").strip()
+            title_lower = title.lower()
             size = getattr(w, "size", lambda: None)()
             width = getattr(size, "width", lambda: 0)() if size else 0
             height = getattr(size, "height", lambda: 0)() if size else 0
-            if title == "":
+            if title == "" or title_lower == "git cloud":
                 try:
                     w.hide()
                     w.close()
@@ -270,7 +274,8 @@ def _cleanup_stray_startup_windows(app, main_window):
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buf, length + 1)
                 title = (buf.value or "").strip()
-                if title == "":
+                title_lower = title.lower()
+                if title == "" or title_lower == "git cloud":
                     user32.ShowWindow(hwnd, 0)
                     user32.PostMessageW(hwnd, 0x0010, 0, 0)
                 return True
@@ -279,6 +284,50 @@ def _cleanup_stray_startup_windows(app, main_window):
         except Exception:
             pass
 
+
+
+def _start_startup_popup_suppressor(duration_sec=8.0):
+    if platform.system() != "Windows":
+        return None
+    stop_event = threading.Event()
+
+    def worker():
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            pid = kernel32.GetCurrentProcessId()
+            end_time = time.time() + duration_sec
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def enum_proc(hwnd, lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                main_hwnd = _STARTUP_WINDOW_MAIN_HWND[0]
+                if main_hwnd and hwnd == main_hwnd:
+                    return True
+                proc_id = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+                if proc_id.value != pid:
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = (buf.value or "").strip().lower()
+                if title in ("", "git cloud"):
+                    user32.ShowWindow(hwnd, 0)
+                    user32.PostMessageW(hwnd, 0x0010, 0, 0)
+                return True
+
+            user32.EnumWindows(enum_proc, 0)
+            while time.time() < end_time and not stop_event.is_set():
+                user32.EnumWindows(enum_proc, 0)
+                time.sleep(0.01)
+        except Exception:
+            return
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return stop_event
 class _StartupPopupFilter(QObject):
     def __init__(self, main_window=None):
         super().__init__()
@@ -289,8 +338,8 @@ class _StartupPopupFilter(QObject):
             if event.type() == QEvent.Type.Show and isinstance(obj, QWidget) and obj.isWindow():
                 if obj is self.main_window:
                     return False
-                title = (getattr(obj, "windowTitle", lambda: "")() or "").strip()
-                if title == "":
+                title = (getattr(obj, "windowTitle", lambda: "")() or "").strip().lower()
+                if title in ("", "git cloud"):
                     try:
                         obj.hide()
                         obj.close()
@@ -1178,13 +1227,16 @@ class GitHubManagerApp(QMainWindow):
         left_panel.setObjectName("LeftPanel")
         left_panel.setFixedWidth(280)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(20, 10, 20, 20)
-        left_layout.setSpacing(15)
+        left_layout.setContentsMargins(20, 12, 20, 20)
+        left_layout.setSpacing(8)
 
         title_label = QLabel("📂 文档控制台")
         title_label.setObjectName("TitleLabel")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        title_label.setMinimumHeight(28)
         left_layout.addWidget(title_label)
-        
+
         search_layout = QHBoxLayout()
         search_layout.setSpacing(5)
         self.search_input = QLineEdit()
@@ -1199,10 +1251,14 @@ class GitHubManagerApp(QMainWindow):
         left_layout.addLayout(search_layout)
 
         self.search_list = QListWidget()
+        self.search_list.setObjectName("SearchResults")
+        self.search_list.setFrameShape(QFrame.Shape.StyledPanel)
+        self.search_list.setFrameShadow(QFrame.Shadow.Plain)
         self.search_list.itemClicked.connect(self.on_search_result_clicked)
         self.search_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.search_list.setVisible(True) 
-        left_layout.addWidget(self.search_list)
+        self.search_list.setVisible(True)
+        self.search_list.setMinimumHeight(180)
+        left_layout.addWidget(self.search_list, 1)
 
         btn_layout = QHBoxLayout()
         self.btn_sync = QPushButton("☁️ 同步")
@@ -1216,8 +1272,6 @@ class GitHubManagerApp(QMainWindow):
         self.btn_copy_url.setFixedHeight(32)
         self.btn_copy_url.clicked.connect(self.copy_selected_url)
         btn_layout.addWidget(self.btn_copy_url)
-        
-        left_layout.addLayout(btn_layout)
 
         status_frame = QFrame()
         status_frame.setObjectName("StatusFrame")
@@ -1229,7 +1283,7 @@ class GitHubManagerApp(QMainWindow):
         self.status_label.setWordWrap(True)
         self.status_label.setObjectName("StatusLabel")
         status_layout.addWidget(self.status_label)
-        
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFixedHeight(4)
@@ -1240,6 +1294,7 @@ class GitHubManagerApp(QMainWindow):
         self.git_status_indicator.setObjectName("GitStatus")
         status_layout.addWidget(self.git_status_indicator)
 
+        left_layout.addLayout(btn_layout)
         left_layout.addWidget(status_frame)
 
         # --- 中间（树） ---
@@ -1272,6 +1327,7 @@ class GitHubManagerApp(QMainWindow):
         toolbar_layout.addWidget(self.btn_config)
         
         tree_layout.addWidget(tree_toolbar)
+
 
         self.source_model = CustomFileSystemModel()
         self.source_model.setRootPath(self.repo_path)
@@ -1413,6 +1469,7 @@ class GitHubManagerApp(QMainWindow):
         #StatusLabel { color: #ccc; font-size: 12px; }
         #GitStatus { font-weight: bold; font-size: 13px; border-top: 1px solid #555; padding-top: 8px; margin-top: 5px; }
         #StatusFrame { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 6px; }
+        #SearchResults { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 6px; }
         QPushButton { background-color: #333; border: 1px solid #555; border-radius: 4px; padding: 4px; color: #eee; }
         QPushButton:hover { background-color: #444; border-color: #666; }
         QPushButton:pressed { background-color: #222; }
@@ -1425,6 +1482,7 @@ class GitHubManagerApp(QMainWindow):
         #TreeToolbar { background-color: #252526; border-bottom: 1px solid #333; }
         QLineEdit { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 4px; padding: 6px; color: #fff; }
         QTreeView, QListWidget { background-color: #252526; border: none; color: #ddd; outline: 0; font-size: 12px; }
+        QListWidget#SearchResults { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 6px; }
         QTreeView::item, QListWidget::item { padding: 2px; border: none; }
         QTreeView::item:hover, QListWidget::item:hover { background-color: #2a2d2e; }
         QTreeView::item:selected, QListWidget::item:selected { background-color: #37373d; color: #fff; border: none; }
@@ -1503,6 +1561,8 @@ class GitHubManagerApp(QMainWindow):
     def perform_search(self):
         text = self.search_input.text().strip().lower()
         self.search_list.clear()
+        self.search_list.setVisible(True)
+        self.search_list.show()
         if not text: return
         source_root_index = self.source_model.index(self.repo_path)
         count = self.search_recursive_populate(source_root_index, text)
@@ -1511,23 +1571,39 @@ class GitHubManagerApp(QMainWindow):
         else:
             self.status_label.setText(f"未找到: {text}")
 
+
     def search_recursive_populate(self, parent_index, text):
-        rows = self.source_model.rowCount(parent_index)
         count = 0
-        for i in range(rows):
-            idx = self.source_model.index(i, 0, parent_index)
-            if self.source_model.isDir(idx) and self.source_model.fileName(idx) == "PDF_url_Gemini":
-                continue
-            name = self.source_model.fileName(idx).lower()
-            file_path = self.source_model.filePath(idx)
-            if text in name:
-                item = QListWidgetItem(name)
-                item.setData(Qt.ItemDataRole.UserRole, file_path)
-                item.setIcon(QIcon(self.source_model.fileIcon(idx)))
-                self.search_list.addItem(item)
-                count += 1
-            if self.source_model.isDir(idx):
-                count += self.search_recursive_populate(idx, text)
+        root_path = self.repo_path
+        for current_root, dirnames, filenames in os.walk(root_path):
+            pruned_dirs = []
+            for d in dirnames:
+                if d == "PDF_url_Gemini":
+                    continue
+                full_dir = os.path.join(current_root, d)
+                try:
+                    if QFileInfo(full_dir).isHidden():
+                        continue
+                except Exception:
+                    pass
+                pruned_dirs.append(d)
+            dirnames[:] = pruned_dirs
+
+            for name in pruned_dirs + filenames:
+                full_path = os.path.join(current_root, name)
+                try:
+                    if QFileInfo(full_path).isHidden():
+                        continue
+                except Exception:
+                    pass
+                if text in name.lower():
+                    idx = self.source_model.index(full_path)
+                    item = QListWidgetItem(name)
+                    item.setData(Qt.ItemDataRole.UserRole, full_path)
+                    if idx.isValid():
+                        item.setIcon(QIcon(self.source_model.fileIcon(idx)))
+                    self.search_list.addItem(item)
+                    count += 1
         return count
 
     def on_search_result_clicked(self, item):
@@ -1554,9 +1630,11 @@ if __name__ == "__main__":
     app.setApplicationName("Git Cloud")
     app.setApplicationDisplayName("Git Cloud")
     app.setWindowIcon(_get_app_icon())
+    suppressor = _start_startup_popup_suppressor()
     startup_filter = _StartupPopupFilter()
     app.installEventFilter(startup_filter)
     window = GitHubManagerApp()
+    _STARTUP_WINDOW_MAIN_HWND[0] = int(window.winId()) if platform.system() == "Windows" else 0
     startup_filter.main_window = window
     _cleanup_stray_startup_windows(app, window)
     window.show()
