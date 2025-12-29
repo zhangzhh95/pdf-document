@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSplitter, QFrame, QProgressBar, QDialog, QDialogButtonBox,
                              QListWidget, QListWidgetItem, QAbstractItemView, QStyledItemDelegate,
                              QSizePolicy, QFormLayout, QStackedWidget, QPlainTextEdit)
-from PyQt6.QtCore import Qt, QDir, QSize, QRectF, QThread, pyqtSignal, QByteArray, QBuffer, QFile, QIODevice, QFileInfo, QMimeData, QSortFilterProxyModel, QTimer, QUrl
+from PyQt6.QtCore import Qt, QDir, QSize, QRectF, QThread, pyqtSignal, QByteArray, QBuffer, QFile, QIODevice, QFileInfo, QMimeData, QSortFilterProxyModel, QTimer, QUrl, QObject, QEvent
 from PyQt6.QtGui import QAction, QIcon, QFileSystemModel, QKeySequence, QFont, QShortcut, QColor, QPainter, QPixmap, QPen
 
 # --- 配置文件路径 ---
@@ -249,6 +249,58 @@ def _cleanup_stray_startup_windows(app, main_window):
     except Exception:
         return
 
+    if platform.system() == "Windows":
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            pid = kernel32.GetCurrentProcessId()
+            main_hwnd = int(main_window.winId()) if main_window else 0
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def enum_proc(hwnd, lparam):
+                if hwnd == main_hwnd:
+                    return True
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                proc_id = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+                if proc_id.value != pid:
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = (buf.value or "").strip()
+                if title == "":
+                    user32.ShowWindow(hwnd, 0)
+                    user32.PostMessageW(hwnd, 0x0010, 0, 0)
+                return True
+
+            user32.EnumWindows(enum_proc, 0)
+        except Exception:
+            pass
+
+class _StartupPopupFilter(QObject):
+    def __init__(self, main_window=None):
+        super().__init__()
+        self.main_window = main_window
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.Type.Show and isinstance(obj, QWidget) and obj.isWindow():
+                if obj is self.main_window:
+                    return False
+                title = (getattr(obj, "windowTitle", lambda: "")() or "").strip()
+                if title == "":
+                    try:
+                        obj.hide()
+                        obj.close()
+                    except Exception:
+                        pass
+                    return True
+        except Exception:
+            return False
+        return False
+
 def _make_windows_explorer_preview_icon():
     pix = QPixmap(18, 18)
     pix.fill(Qt.GlobalColor.transparent)
@@ -461,8 +513,25 @@ class GitStatusWorker(QThread):
     def run(self):
         try:
             repo = Repo(self.repo_path)
-            count = len(repo.index.diff(None)) + len(repo.index.diff("HEAD")) + len(repo.untracked_files)
-            self.result_signal.emit(count, True)
+            changed = set()
+            try:
+                for diff in repo.index.diff(None):
+                    path = diff.a_path or diff.b_path
+                    if path:
+                        changed.add(path)
+            except Exception:
+                pass
+            try:
+                for diff in repo.index.diff("HEAD"):
+                    path = diff.a_path or diff.b_path
+                    if path:
+                        changed.add(path)
+            except Exception:
+                pass
+            for path in repo.untracked_files:
+                if path:
+                    changed.add(path)
+            self.result_signal.emit(len(changed), True)
         except Exception:
             self.result_signal.emit(0, False)
 
@@ -1061,11 +1130,6 @@ class GitHubManagerApp(QMainWindow):
         self.repo_path = self.config.get("repo_path", r"D:\Github\pdf-document")
         self.base_url = self.config.get("base_url", "https://zhangzhh95.github.io/pdf-document/")
         
-        self.preview_mode = None 
-        self.preview_widget = None
-        self.preview_document = None
-        self.preview_text_widget = None
-        self.preview_pdf_device = None
         
         if not os.path.exists(self.repo_path):
             QMessageBox.critical(self, "路径错误", f"找不到仓库路径：{self.repo_path}\n请在设置中修改。")
@@ -1198,14 +1262,6 @@ class GitHubManagerApp(QMainWindow):
         self.btn_refresh_tree.clicked.connect(self.refresh_tree)
 
         
-        self.btn_preview_toggle = QPushButton("预览")
-        self.btn_preview_toggle.setObjectName("PreviewToggle")
-        self.btn_preview_toggle.setIcon(_make_windows_explorer_preview_icon())
-        self.btn_preview_toggle.setIconSize(QSize(18, 18))
-        self.btn_preview_toggle.setFixedWidth(80)
-        self.btn_preview_toggle.setCheckable(True)
-        self.btn_preview_toggle.clicked.connect(self.toggle_preview_panel)
-
         self.btn_config = QPushButton("⚙️")
         self.btn_config.setFixedWidth(40)
         self.btn_config.clicked.connect(self.open_config)
@@ -1213,7 +1269,6 @@ class GitHubManagerApp(QMainWindow):
         toolbar_layout.addWidget(self.btn_toggle_expand)
         toolbar_layout.addWidget(self.btn_refresh_tree)
         toolbar_layout.addStretch() 
-        toolbar_layout.addWidget(self.btn_preview_toggle)
         toolbar_layout.addWidget(self.btn_config)
         
         tree_layout.addWidget(tree_toolbar)
@@ -1228,10 +1283,7 @@ class GitHubManagerApp(QMainWindow):
         self.tree = CustomTreeView(self.repo_path)
         self.tree.setModel(self.proxy_model)
         
-        # 连接释放信号到清除预览
-        self.tree.releasePreviewSignal.connect(self.clear_preview_lock)
         
-        self.tree.clicked.connect(self.on_tree_clicked)
         self.tree.doubleClicked.connect(self.on_tree_double_click)
 
         root_index = self.source_model.index(self.repo_path)
@@ -1249,192 +1301,14 @@ class GitHubManagerApp(QMainWindow):
         
         tree_layout.addWidget(self.tree)
 
-        # --- 右侧预览区 ---
-        self.preview_panel = QWidget()
-        self.preview_panel.setVisible(False)
-        self.preview_layout = QVBoxLayout(self.preview_panel)
-        self.preview_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.preview_widget = None # 懒加载
 
-        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.content_splitter.addWidget(tree_container)
-        self.content_splitter.addWidget(self.preview_panel)
-        self.content_splitter.setSizes([1000, 0])
-        self.content_splitter.setCollapsible(1, True)
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.addWidget(left_panel)
-        main_splitter.addWidget(self.content_splitter)
+        main_splitter.addWidget(tree_container)
         
         main_layout.addWidget(main_splitter)
-
-    # 优化2: 异步加载 + 严防死守启动白窗
-    def toggle_preview_panel(self):
-        is_visible = self.btn_preview_toggle.isChecked()
-        self.preview_panel.setVisible(is_visible)
-        
-        if is_visible:
-            sizes = self.content_splitter.sizes()
-            if len(sizes) > 1 and sizes[1] < 50:
-                total = sum(sizes)
-                self.content_splitter.setSizes([int(total * 0.6), int(total * 0.4)])
-            
-            if self.preview_widget is None:
-                QTimer.singleShot(10, self._lazy_load_preview_engine)
-            else:
-                self.update_preview()
-        
-    def _lazy_load_preview_engine(self):
-        try:
-            from PyQt6.QtPdf import QPdfDocument
-            from PyQt6.QtPdfWidgets import QPdfView
-
-            class _PdfViewWithZoom(QPdfView):
-                def wheelEvent(self, event):
-                    if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                        delta_y = event.angleDelta().y()
-                        if delta_y == 0:
-                            event.ignore()
-                            return
-                        step = 1.1 if delta_y > 0 else 1 / 1.1
-                        new_factor = max(0.1, min(5.0, self.zoomFactor() * step))
-                        self.setZoomMode(QPdfView.ZoomMode.Custom)
-                        self.setZoomFactor(new_factor)
-                        event.accept()
-                        return
-                    super().wheelEvent(event)
-
-            self.preview_document = QPdfDocument(self)
-            self.preview_widget = _PdfViewWithZoom(self.preview_panel)
-            self.preview_widget.setDocument(self.preview_document)
-            self.preview_widget.setPageMode(QPdfView.PageMode.MultiPage)
-            self.preview_widget.setZoomMode(QPdfView.ZoomMode.FitToWidth)
-            self.preview_layout.addWidget(self.preview_widget)
-
-            self.preview_text_widget = QPlainTextEdit(self.preview_panel)
-            self.preview_text_widget.setReadOnly(True)
-            self.preview_text_widget.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-            self.preview_text_widget.setFont(QFont("Microsoft YaHei", 10))
-            self.preview_text_widget.hide()
-            self.preview_layout.addWidget(self.preview_text_widget)
-            self.preview_mode = "QTPDF"
-        except Exception:
-            self.preview_mode = "NONE"
-            lbl = QLabel("PDF 预览组件缺失\n需 PyQt6.QtPdf / PyQt6.QtPdfWidgets", self.preview_panel)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: #888;")
-            self.preview_layout.addWidget(lbl)
-        
-        self.update_preview()
-
-    def on_tree_clicked(self, index):
-        if self.btn_preview_toggle.isChecked():
-            self.update_preview(index)
-
-    def clear_preview_lock(self):
-        if self.preview_widget and self.preview_mode:
-            if self.preview_mode == "QTPDF" and self.preview_document is not None:
-                self.preview_document.close()
-                if self.preview_pdf_device is not None:
-                    try:
-                        self.preview_pdf_device.close()
-                    except Exception:
-                        pass
-                    self.preview_pdf_device = None
-            elif self.preview_mode == "WEBENGINE":
-                self.preview_widget.setUrl(QUrl("about:blank"))
-            elif self.preview_mode == "ACTIVEX":
-                self.preview_widget.dynamicCall("Navigate(const QString&)", "about:blank")
-        if self.preview_text_widget is not None:
-            self.preview_text_widget.setPlainText("")
-            self.preview_text_widget.hide()
-
-    def update_preview(self, index=None):
-        if self.preview_widget is None: return
-        
-        if index is None:
-            index = self.tree.currentIndex()
-        if not index.isValid(): return
-
-        source_index = self.proxy_model.mapToSource(index)
-        file_path = self.source_model.filePath(source_index)
-        
-        if os.path.isfile(file_path):
-            if self.preview_mode == "QTPDF" and self.preview_document is not None:
-                lower = file_path.lower()
-                if lower.endswith(".pdf"):
-                    if self.preview_text_widget is not None:
-                        self.preview_text_widget.hide()
-                    self.preview_widget.show()
-                    try:
-                        from PyQt6.QtPdf import QPdfDocument
-                        if self.preview_pdf_device is not None:
-                            try:
-                                self.preview_pdf_device.close()
-                            except Exception:
-                                pass
-                        self.preview_pdf_device = None
-                        err = self.preview_document.load(file_path)
-                        if err == QPdfDocument.Error.InvalidFileFormat:
-                            device = QFile(file_path)
-                            if device.open(QIODevice.OpenModeFlag.ReadOnly):
-                                self.preview_pdf_device = device
-                                err = self.preview_document.load(device)
-                            else:
-                                try:
-                                    device.close()
-                                except Exception:
-                                    pass
-                        if err == QPdfDocument.Error.InvalidFileFormat:
-                            try:
-                                if os.path.getsize(file_path) <= 50 * 1024 * 1024:
-                                    with open(file_path, "rb") as f:
-                                        pdf_bytes = f.read()
-                                    buf = QBuffer()
-                                    buf.setData(QByteArray(pdf_bytes))
-                                    buf.open(QIODevice.OpenModeFlag.ReadOnly)
-                                    self.preview_pdf_device = buf
-                                    err = self.preview_document.load(buf)
-                            except Exception:
-                                pass
-                        if err != QPdfDocument.Error.None_:
-                            try:
-                                with open(file_path, "rb") as f:
-                                    head = f.read(1024)
-                                if b"git-lfs.github.com/spec/v1" in head:
-                                    self.status_label.setText("PDF预览失败: Git LFS 指针文件，请在仓库执行 git lfs pull")
-                                elif b"%PDF-" not in head:
-                                    self.status_label.setText("PDF预览失败: 文件不是有效PDF")
-                                else:
-                                    self.status_label.setText(f"PDF预览失败:{err}")
-                            except Exception:
-                                self.status_label.setText(f"PDF预览失败:{err}")
-                    except Exception:
-                        self.preview_document.load(file_path)
-                elif lower.endswith(".txt"):
-                    try:
-                        text = _read_text_file_best_effort(file_path)
-
-                        if self.preview_text_widget is None:
-                            self.preview_text_widget = QPlainTextEdit(self.preview_panel)
-                            self.preview_text_widget.setReadOnly(True)
-                            self.preview_text_widget.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-                            self.preview_text_widget.setFont(QFont("Microsoft YaHei", 10))
-                            self.preview_layout.addWidget(self.preview_text_widget)
-                        self.preview_text_widget.setPlainText(text)
-                        self.preview_widget.hide()
-                        self.preview_text_widget.show()
-                    except Exception:
-                        self.clear_preview_lock()
-                else:
-                    self.clear_preview_lock()
-            elif self.preview_mode == "WEBENGINE":
-                self.preview_widget.setUrl(QUrl.fromLocalFile(file_path))
-            elif self.preview_mode == "ACTIVEX":
-                self.preview_widget.dynamicCall("Navigate(const QString&)", file_path)
-        else:
-            self.clear_preview_lock()
 
     def open_config(self):
         dlg = ConfigDialog(self.repo_path, self.base_url, self)
@@ -1680,7 +1554,11 @@ if __name__ == "__main__":
     app.setApplicationName("Git Cloud")
     app.setApplicationDisplayName("Git Cloud")
     app.setWindowIcon(_get_app_icon())
+    startup_filter = _StartupPopupFilter()
+    app.installEventFilter(startup_filter)
     window = GitHubManagerApp()
+    startup_filter.main_window = window
+    _cleanup_stray_startup_windows(app, window)
     window.show()
     try:
         window._startup_cleanup_count = 0
@@ -1696,4 +1574,8 @@ if __name__ == "__main__":
         window._startup_cleanup_timer.start(100)
     except Exception:
         QTimer.singleShot(150, lambda: _cleanup_stray_startup_windows(app, window))
+    try:
+        QTimer.singleShot(2000, lambda: app.removeEventFilter(startup_filter))
+    except Exception:
+        pass
     sys.exit(app.exec())
