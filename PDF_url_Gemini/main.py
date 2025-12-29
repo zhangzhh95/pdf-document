@@ -24,7 +24,29 @@ from PyQt6.QtCore import Qt, QDir, QSize, QRectF, QThread, pyqtSignal, QByteArra
 from PyQt6.QtGui import QAction, QIcon, QFileSystemModel, QKeySequence, QFont, QShortcut, QColor, QPainter, QPixmap, QPen
 
 # --- 配置文件路径 ---
-CONFIG_FILE = "app_config.json"
+def _get_user_data_dir():
+    base = os.environ.get("APPDATA")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    path = os.path.join(base, "Git Cloud")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+def _get_legacy_config_file():
+    try:
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            local = os.path.join(exe_dir, "app_config.json")
+            parent = os.path.abspath(os.path.join(exe_dir, os.pardir, "app_config.json"))
+            return [local, parent]
+        return os.path.join(os.path.abspath(os.path.dirname(__file__)), "app_config.json")
+    except Exception:
+        return "app_config.json"
+
+CONFIG_FILE = os.path.join(_get_user_data_dir(), "app_config.json")
 DEFAULT_CONFIG = {
     "repo_path": r"D:\Github\pdf-document",
     "base_url": "https://zhangzhh95.github.io/pdf-document/"
@@ -73,11 +95,25 @@ def _read_text_file_best_effort(file_path, max_bytes=2 * 1024 * 1024):
                     except Exception:
                         pass
 
+
+        strict_utf8 = None
+        try:
+            strict_utf8 = data.decode("utf-8")
+        except Exception:
+            pass
+
         non_ascii = sum(1 for b in data if b >= 0x80)
         if non_ascii == 0:
             return data.decode("utf-8", errors="replace")
 
         candidates = []
+        if strict_utf8 is not None:
+            candidates.append(("utf-8", strict_utf8))
+        try:
+            import locale
+            preferred = locale.getpreferredencoding(False)
+        except Exception:
+            preferred = None
         for enc in (
             "utf-8",
             "gb18030",
@@ -91,6 +127,11 @@ def _read_text_file_best_effort(file_path, max_bytes=2 * 1024 * 1024):
             except Exception:
                 continue
             candidates.append((enc, text))
+        if preferred and preferred.lower() not in {c[0].lower() for c in candidates}:
+            try:
+                candidates.append((preferred, data.decode(preferred, errors="replace")))
+            except Exception:
+                pass
 
         if not candidates:
             return data.decode("utf-8", errors="replace")
@@ -101,7 +142,10 @@ def _read_text_file_best_effort(file_path, max_bytes=2 * 1024 * 1024):
             cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
             cjk_ratio = cjk / max(1, len(text))
             cjk_bonus = cjk if cjk_ratio >= 0.02 else 0
-            return bad * 1000 + control * 10 - cjk_bonus
+            latin1 = sum(1 for ch in text if "\u00c0" <= ch <= "\u00ff")
+            latin1_ratio = latin1 / max(1, len(text))
+            mojibake_penalty = latin1 * 2 if cjk_ratio < 0.02 and latin1_ratio > 0.02 else 0
+            return bad * 1000 + control * 10 - cjk_bonus + mojibake_penalty
 
         best = min(candidates, key=lambda x: score(x[1]))
         return best[1]
@@ -196,7 +240,7 @@ def _cleanup_stray_startup_windows(app, main_window):
             size = getattr(w, "size", lambda: None)()
             width = getattr(size, "width", lambda: 0)() if size else 0
             height = getattr(size, "height", lambda: 0)() if size else 0
-            if title == "" and width <= 600 and height <= 400:
+            if title == "":
                 try:
                     w.hide()
                     w.close()
@@ -262,14 +306,17 @@ def _get_windows_inet_proxy():
 
     try:
         startupinfo = None
+        creationflags = 0
         if platform.system() == "Windows":
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         r = subprocess.run(
             ["netsh", "winhttp", "show", "proxy"],
             capture_output=True,
             text=True,
             startupinfo=startupinfo,
+            creationflags=creationflags,
         )
         out = (r.stdout or "") + "\n" + (r.stderr or "")
         if "Direct access" in out:
@@ -297,9 +344,11 @@ def _run_git_cli(repo_path, git_args, env_overrides=None, timeout_sec=90):
         env.update(env_overrides)
 
     startupinfo = None
+    creationflags = 0
     if platform.system() == "Windows":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     try:
         r = subprocess.run(
@@ -309,6 +358,7 @@ def _run_git_cli(repo_path, git_args, env_overrides=None, timeout_sec=90):
             errors="replace",
             env=env,
             startupinfo=startupinfo,
+            creationflags=creationflags,
             timeout=timeout_sec,
         )
     except subprocess.TimeoutExpired:
@@ -338,12 +388,24 @@ def _git_push_with_timeout(repo_path, proxy=None, timeout_sec=180):
 class ConfigManager:
     @staticmethod
     def load():
-        if os.path.exists(CONFIG_FILE):
+        legacy = _get_legacy_config_file()
+        legacy_paths = legacy if isinstance(legacy, (list, tuple)) else [legacy]
+        for path in [*legacy_paths, CONFIG_FILE]:
+            if not path:
+                continue
+            if not os.path.exists(path):
+                continue
             try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                with open(path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                try:
+                    if os.path.abspath(path) != os.path.abspath(CONFIG_FILE):
+                        ConfigManager.save(cfg)
+                except Exception:
+                    pass
+                return cfg
             except:
-                return DEFAULT_CONFIG
+                pass
         return DEFAULT_CONFIG
 
     @staticmethod
@@ -781,12 +843,14 @@ class CustomTreeView(QTreeView):
                 f"-sOutputFile={temp_output}", input_path
             ]
             startupinfo = None
+            creationflags = 0
             if platform.system() == 'Windows':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            subprocess.run(cmd, startupinfo=startupinfo, check=True)
+            subprocess.run(cmd, startupinfo=startupinfo, creationflags=creationflags, check=True)
             QApplication.restoreOverrideCursor()
             return temp_output
         except Exception as e:
@@ -1129,6 +1193,10 @@ class GitHubManagerApp(QMainWindow):
         self.btn_toggle_expand = QPushButton("∧ / ∨")
         self.btn_toggle_expand.setFixedWidth(80)
         self.btn_toggle_expand.clicked.connect(self.toggle_tree_expansion)
+        self.btn_refresh_tree = QPushButton("\u27F3")
+        self.btn_refresh_tree.setFixedWidth(40)
+        self.btn_refresh_tree.clicked.connect(self.refresh_tree)
+
         
         self.btn_preview_toggle = QPushButton("预览")
         self.btn_preview_toggle.setObjectName("PreviewToggle")
@@ -1143,6 +1211,7 @@ class GitHubManagerApp(QMainWindow):
         self.btn_config.clicked.connect(self.open_config)
 
         toolbar_layout.addWidget(self.btn_toggle_expand)
+        toolbar_layout.addWidget(self.btn_refresh_tree)
         toolbar_layout.addStretch() 
         toolbar_layout.addWidget(self.btn_preview_toggle)
         toolbar_layout.addWidget(self.btn_config)
@@ -1332,8 +1401,10 @@ class GitHubManagerApp(QMainWindow):
                         if err != QPdfDocument.Error.None_:
                             try:
                                 with open(file_path, "rb") as f:
-                                    file_head = f.read(5)
-                                if file_head != b"%PDF-":
+                                    head = f.read(1024)
+                                if b"git-lfs.github.com/spec/v1" in head:
+                                    self.status_label.setText("PDF预览失败: Git LFS 指针文件，请在仓库执行 git lfs pull")
+                                elif b"%PDF-" not in head:
                                     self.status_label.setText("PDF预览失败: 文件不是有效PDF")
                                 else:
                                     self.status_label.setText(f"PDF预览失败:{err}")
@@ -1405,6 +1476,54 @@ class GitHubManagerApp(QMainWindow):
         else:
             self.tree.expandAll()
             self.is_all_expanded = True
+
+    def _get_expanded_paths(self):
+        expanded = set()
+        root = self.tree.rootIndex()
+        def walk(parent):
+            rows = self.proxy_model.rowCount(parent)
+            for r in range(rows):
+                idx = self.proxy_model.index(r, 0, parent)
+                if self.tree.isExpanded(idx):
+                    src_idx = self.proxy_model.mapToSource(idx)
+                    expanded.add(self.source_model.filePath(src_idx))
+                    walk(idx)
+        walk(root)
+        return expanded
+
+    def _get_current_path(self):
+        idx = self.tree.currentIndex()
+        if idx.isValid():
+            src_idx = self.proxy_model.mapToSource(idx)
+            return self.source_model.filePath(src_idx)
+        return None
+
+    def _restore_tree_state(self, expanded_paths, current_path):
+        for path in expanded_paths:
+            src_idx = self.source_model.index(path)
+            if src_idx.isValid():
+                proxy_idx = self.proxy_model.mapFromSource(src_idx)
+                if proxy_idx.isValid():
+                    self.tree.setExpanded(proxy_idx, True)
+        if current_path:
+            src_idx = self.source_model.index(current_path)
+            if src_idx.isValid():
+                proxy_idx = self.proxy_model.mapFromSource(src_idx)
+                if proxy_idx.isValid():
+                    sel = self.tree.selectionModel()
+                    sel.setCurrentIndex(proxy_idx, sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows)
+                    self.tree.scrollTo(proxy_idx)
+
+    def refresh_tree(self):
+        expanded_paths = self._get_expanded_paths()
+        current_path = self._get_current_path()
+        self.source_model.setRootPath("")
+        self.source_model.setRootPath(self.repo_path)
+        root_index = self.source_model.index(self.repo_path)
+        proxy_root_index = self.proxy_model.mapFromSource(root_index)
+        self.tree.setRootIndex(proxy_root_index)
+        self.tree.update_repo_path(self.repo_path)
+        QTimer.singleShot(50, lambda: self._restore_tree_state(expanded_paths, current_path))
 
     def apply_dark_theme(self):
         font = QFont("Microsoft YaHei")
@@ -1570,7 +1689,7 @@ if __name__ == "__main__":
         def _startup_cleanup_tick():
             _cleanup_stray_startup_windows(app, window)
             window._startup_cleanup_count += 1
-            if window._startup_cleanup_count >= 20:
+            if window._startup_cleanup_count >= 50:
                 window._startup_cleanup_timer.stop()
 
         window._startup_cleanup_timer.timeout.connect(_startup_cleanup_tick)
