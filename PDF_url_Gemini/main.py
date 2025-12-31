@@ -729,6 +729,8 @@ class CustomTreeView(QTreeView):
         self._is_cut_operation = False 
         self.undo_stack = []
         self._is_undoing = False
+        self._context_index = None
+        self._context_on_blank = False
 
     def update_repo_path(self, new_path):
         self.repo_path = new_path
@@ -818,6 +820,16 @@ class CustomTreeView(QTreeView):
             return file_path
         else:
             return os.path.dirname(file_path)
+
+    def _get_root_dir(self):
+        root = self.rootIndex()
+        model = self.model()
+        if isinstance(model, QSortFilterProxyModel):
+            root = model.mapToSource(root)
+            model = model.sourceModel()
+        if root.isValid():
+            return model.filePath(root)
+        return self.repo_path
 
     def safe_move(self, src, dst):
         if os.path.abspath(src) == os.path.abspath(dst):
@@ -977,6 +989,10 @@ class CustomTreeView(QTreeView):
 
     def open_context_menu(self, position):
         menu = QMenu()
+        clicked_index = self.indexAt(position)
+        self._context_on_blank = not clicked_index.isValid()
+        self._context_index = clicked_index if clicked_index.isValid() else None
+
         selected_rows = self.selectionModel().selectedRows(0)
         has_selection = len(selected_rows) > 0
         single_selection = len(selected_rows) == 1
@@ -1013,6 +1029,8 @@ class CustomTreeView(QTreeView):
         menu.addAction(act_delete)
 
         menu.exec(self.viewport().mapToGlobal(position))
+        self._context_index = None
+        self._context_on_blank = False
 
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.StandardKey.Copy):
@@ -1040,7 +1058,12 @@ class CustomTreeView(QTreeView):
         return paths
 
     def action_new_folder(self):
-        target_dir = self.get_target_dir()
+        if self._context_on_blank:
+            target_dir = self._get_root_dir()
+        elif self._context_index is not None and self._context_index.isValid():
+            target_dir = self.get_target_dir(self._context_index)
+        else:
+            target_dir = self.get_target_dir()
         name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称:")
         if ok and name:
             new_path = os.path.join(target_dir, name)
@@ -1250,15 +1273,22 @@ class GitHubManagerApp(QMainWindow):
         search_layout.addWidget(search_btn)
         left_layout.addLayout(search_layout)
 
+        search_frame = QFrame()
+        search_frame.setObjectName("SearchResultsFrame")
+        search_frame.setMinimumHeight(320)
+        search_frame_layout = QVBoxLayout(search_frame)
+        search_frame_layout.setContentsMargins(10, 10, 10, 10)
+        search_frame_layout.setSpacing(0)
+
         self.search_list = QListWidget()
         self.search_list.setObjectName("SearchResults")
-        self.search_list.setFrameShape(QFrame.Shape.StyledPanel)
-        self.search_list.setFrameShadow(QFrame.Shadow.Plain)
+        self.search_list.setFrameShape(QFrame.Shape.NoFrame)
         self.search_list.itemClicked.connect(self.on_search_result_clicked)
         self.search_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.search_list.setVisible(True)
-        self.search_list.setMinimumHeight(180)
-        left_layout.addWidget(self.search_list, 1)
+
+        search_frame_layout.addWidget(self.search_list)
+        left_layout.addWidget(search_frame, 1)
 
         btn_layout = QHBoxLayout()
         self.btn_sync = QPushButton("☁️ 同步")
@@ -1469,7 +1499,6 @@ class GitHubManagerApp(QMainWindow):
         #StatusLabel { color: #ccc; font-size: 12px; }
         #GitStatus { font-weight: bold; font-size: 13px; border-top: 1px solid #555; padding-top: 8px; margin-top: 5px; }
         #StatusFrame { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 6px; }
-        #SearchResults { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 6px; }
         QPushButton { background-color: #333; border: 1px solid #555; border-radius: 4px; padding: 4px; color: #eee; }
         QPushButton:hover { background-color: #444; border-color: #666; }
         QPushButton:pressed { background-color: #222; }
@@ -1481,8 +1510,9 @@ class GitHubManagerApp(QMainWindow):
         #GreenButton:hover { background-color: #218838; }
         #TreeToolbar { background-color: #252526; border-bottom: 1px solid #333; }
         QLineEdit { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 4px; padding: 6px; color: #fff; }
-        QTreeView, QListWidget { background-color: #252526; border: none; color: #ddd; outline: 0; font-size: 12px; }
-        QListWidget#SearchResults { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 6px; }
+        QTreeView { background-color: #252526; border: none; color: #ddd; outline: 0; font-size: 12px; }
+        #SearchResultsFrame { background-color: #252526; border: 1px solid #3e3e3e; border-radius: 6px; }
+        QListWidget#SearchResults { background-color: transparent; border: none; }
         QTreeView::item, QListWidget::item { padding: 2px; border: none; }
         QTreeView::item:hover, QListWidget::item:hover { background-color: #2a2d2e; }
         QTreeView::item:selected, QListWidget::item:selected { background-color: #37373d; color: #fff; border: none; }
